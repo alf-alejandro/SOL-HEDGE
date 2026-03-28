@@ -92,7 +92,9 @@ NEAR_RESOLUTION_THRESH = 0.82  # no vender si bid >= 0.82 y secs <= 90
 NEAR_RESOLUTION_SECS   = 90
 
 # ─── ESTADO GLOBAL ────────────────────────────────────────────────────────────
-PAUSED = True   # [4] Bot arranca PAUSADO
+PAUSED       = True   # [4] Bot arranca PAUSADO
+SIM_MODE     = False
+_mkt_activo  = None   # referencia al mercado activo actual (para comprar_sim)
 
 estado = {
     "capital":      CAPITAL_INICIAL,
@@ -173,6 +175,7 @@ def guardar_estado(up_m=None, dn_m=None):
                 "ob_up":           ob_up,
                 "ob_dn":           ob_dn,
                 "paused":          PAUSED,
+                "sim_mode":        SIM_MODE,
                 "posicion": {
                     "activa":        pos["activa"],
                     "lado1":         pos["lado1_side"],
@@ -373,6 +376,34 @@ def forzar_salida(
     return exit_precio, pnl
 
 
+# ─── COMPRA SIMULADA CON LAG ──────────────────────────────────────────────────
+
+def comprar_sim(lado: str) -> tuple[float, float, float]:
+    """Simula una compra con 0.5s de lag: re-lee el order book y usa mid en ese momento."""
+    time.sleep(0.5)
+
+    if _mkt_activo is None:
+        return 0.0, 0.0, 0.0
+
+    token_id = _mkt_activo["up_token_id"] if lado == "UP" else _mkt_activo["down_token_id"]
+    ob, _    = get_order_book_metrics(token_id)
+    if not ob:
+        return 0.0, 0.0, 0.0
+
+    precio = (ob["best_bid"] + ob["best_ask"]) / 2
+    precio = round(precio, 4)
+    usd    = MONTO_FIJO_POR_LADO
+
+    if usd > estado["capital"]:
+        log_ev(f"  [SIM] Capital insuficiente: ${estado['capital']:.2f} < ${usd:.2f}")
+        return 0.0, 0.0, 0.0
+
+    shares   = round(usd / precio, 4)
+    estado["capital"] -= usd
+    log_ev(f"  [SIM+LAG] COMPRA {lado} @ {precio:.4f} (mid+0.5s) | {shares:.4f}sh | ${usd:.2f} | cap=${estado['capital']:.2f}")
+    return precio, shares, usd
+
+
 # ─── SEÑAL DE ENTRADA ─────────────────────────────────────────────────────────
 
 def evaluar_señal(up_m, dn_m):
@@ -393,19 +424,19 @@ def evaluar_señal(up_m, dn_m):
 
     if signal_up["combined"] >= OBI_STRONG_THRESHOLD:
         if PRECIO_MIN_LADO1 <= mid_up <= PRECIO_MAX_LADO1:
-            return signal_up, signal_dn, "UP"
+            return signal_up, signal_dn, "DOWN"
 
     if signal_dn["combined"] >= OBI_STRONG_THRESHOLD:
         if PRECIO_MIN_LADO1 <= mid_dn <= PRECIO_MAX_LADO1:
-            return signal_up, signal_dn, "DOWN"
+            return signal_up, signal_dn, "UP"
 
     if signal_up["label"] in ("UP", "STRONG UP") and signal_up["combined"] > signal_dn["combined"]:
         if PRECIO_MIN_LADO1 <= mid_up <= PRECIO_MAX_LADO1:
-            return signal_up, signal_dn, "UP"
+            return signal_up, signal_dn, "DOWN"
 
     if signal_dn["label"] in ("UP", "STRONG UP") and signal_dn["combined"] > signal_up["combined"]:
         if PRECIO_MIN_LADO1 <= mid_dn <= PRECIO_MAX_LADO1:
-            return signal_up, signal_dn, "DOWN"
+            return signal_up, signal_dn, "UP"
 
     return signal_up, signal_dn, None
 
@@ -427,7 +458,10 @@ def intentar_entrada(up_m, dn_m, secs) -> bool:
 
     log_ev(f"SEÑAL {lado} — OBI={obi:+.3f} | mid={mid(m_lado):.4f} | {int(secs)}s restantes")
 
-    precio, shares, usd = comprar(lado, m_lado)
+    if SIM_MODE:
+        precio, shares, usd = comprar_sim(lado)
+    else:
+        precio, shares, usd = comprar(lado, m_lado)
     if usd == 0.0:
         return False
 
@@ -462,7 +496,7 @@ def intentar_hedge(up_m, dn_m):
         return
 
     obi_lado2 = m_lado2["obi"]
-    if obi_lado2 < HEDGE_OBI_MIN:
+    if obi_lado2 > -HEDGE_OBI_MIN:
         return
 
     # Fiel a prod: valida rango con best_ask (no mid) — prod compra taker al ask
@@ -472,7 +506,10 @@ def intentar_hedge(up_m, dn_m):
 
     log_ev(f"  Lado1 subio {subida*100:+.1f}c — hedgeando en {lado2} @ ask={ask_lado2:.4f}")
 
-    precio, shares, usd = comprar(lado2, m_lado2)
+    if SIM_MODE:
+        precio, shares, usd = comprar_sim(lado2)
+    else:
+        precio, shares, usd = comprar(lado2, m_lado2)
     if usd == 0.0:
         return
 
@@ -639,6 +676,20 @@ def pausar_bot():
     log_ev("Bot PAUSADO")
     guardar_estado()
 
+def activar_sim():
+    global PAUSED, SIM_MODE
+    SIM_MODE = True
+    PAUSED   = False
+    log_ev("Bot SIMULACION ACTIVADO")
+    guardar_estado()
+
+def pausar_sim():
+    global PAUSED, SIM_MODE
+    SIM_MODE = False
+    PAUSED   = True
+    log_ev("Bot SIMULACION PAUSADO")
+    guardar_estado()
+
 
 # ─── LOOP PRINCIPAL ───────────────────────────────────────────────────────────
 
@@ -691,6 +742,7 @@ async def main_loop():
                     estado["ciclos"] += 1
                     mkt_end_date = mkt.get("end_date")
                     log_ev(f"Mercado: {mkt.get('question', '')}")
+                    _mkt_activo = mkt
                     guardar_estado()
                 else:
                     log_ev("Sin mercado activo — reintentando en 10s...")
@@ -802,6 +854,17 @@ if __name__ == "__main__":
             elif self.path == "/api/stop":
                 pausar_bot()
                 self._send(200, "application/json", b'{"ok":true,"msg":"Bot pausado"}')
+            elif self.path == "/api/reset":
+                resetear_pos()
+                log_ev("Posicion reseteada manualmente via /api/reset")
+                guardar_estado()
+                self._send(200, "application/json", b'{"ok":true,"msg":"Posicion reseteada"}')
+            elif self.path == "/api/start_sim":
+                activar_sim()
+                self._send(200, "application/json", b'{"ok":true,"msg":"Simulacion activada"}')
+            elif self.path == "/api/stop_sim":
+                pausar_sim()
+                self._send(200, "application/json", b'{"ok":true,"msg":"Simulacion pausada"}')
             else:
                 self._send(404, "text/plain", b"Not found")
 
