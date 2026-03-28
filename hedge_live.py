@@ -694,7 +694,7 @@ def pausar_sim():
 # ─── LOOP PRINCIPAL ───────────────────────────────────────────────────────────
 
 async def main_loop():
-    global _ob_error_count
+    global _ob_error_count, _mkt_activo
 
     log_ev("=" * 65)
     log_ev("  HEDGE LIVE v9 — Sim con condiciones realistas — SOL")
